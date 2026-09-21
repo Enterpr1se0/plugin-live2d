@@ -3,6 +3,7 @@ import { ModelLayoutEvent } from "@/live2d/events/model-layout";
 import { loadMergedTips } from "@/live2d/helpers/loadMergedTips";
 import { sendMessage } from "@/live2d/helpers/sendMessage";
 import { logConsoleStatus } from "@/live2d/live2d/console-status";
+import { haltEngineMotions } from "@/live2d/live2d/engine-motions";
 import { isNotEmptyString } from "@/live2d/utils/isString";
 import * as PIXI from "pixi.js";
 import "@/live2d/libs/live2d.min.js";
@@ -245,22 +246,7 @@ class Model {
   }
 
   private stopEngineMotions(model: Live2DModel): void {
-    const internal = model.internalModel;
-    if (!internal) return;
-
-    // Stop primary motion manager
-    if (typeof internal.motionManager?.stopAllMotions === "function") {
-      internal.motionManager.stopAllMotions();
-    }
-
-    // Stop parallel motion managers (e.g., for Cubism 2.1 .mtn files)
-    if (Array.isArray(internal.parallelMotionManager)) {
-      for (const pm of internal.parallelMotionManager) {
-        if (typeof pm?.stopAllMotions === "function") {
-          pm.stopAllMotions();
-        }
-      }
-    }
+    haltEngineMotions(model.internalModel);
   }
 
   private getSpeechAnchorTopY(
