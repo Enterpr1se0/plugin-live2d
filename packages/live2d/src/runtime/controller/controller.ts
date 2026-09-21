@@ -58,6 +58,9 @@ export class Live2dRuntimeController {
 
     // 1. Semantic parameter detection
     this.semanticLayer.detectFromModel(model);
+    // Drop anything queued against the previous model, and the add
+    // contributions that describe its parameters.
+    this.coordinator.reset();
 
     // 2. Motion layer system
     if (this.config.motionLayers?.enabled !== false) {

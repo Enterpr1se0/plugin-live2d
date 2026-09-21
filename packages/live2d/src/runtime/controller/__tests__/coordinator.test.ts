@@ -92,6 +92,17 @@ describe("ParameterCoordinator", () => {
       expect(coordinator.getConflictLog()).toEqual([]);
     });
 
+    it("keeps the first override when priorities are equal", () => {
+      coordinator.queueWrite("mouthOpen", 0.5, "override", "first", SystemPriority.FSM);
+      coordinator.queueWrite("mouthOpen", 0.8, "override", "second", SystemPriority.FSM);
+      coordinator.flush();
+
+      const accessor = getAccessor(semanticLayer);
+      expect(accessor.setValue).toHaveBeenCalledWith(0, 0.5);
+      expect(coordinator.getConflictLog()[0].winningSystem).toBe("first");
+      expect(coordinator.getConflictLog()[0].losingSystem).toBe("second");
+    });
+
     it("does not log conflict for add blend mode", () => {
       coordinator.queueWrite("mouthOpen", 0.5, "add", "fsm", SystemPriority.FSM);
       coordinator.queueWrite("mouthOpen", 0.3, "add", "emotion", SystemPriority.EMOTION);
@@ -182,6 +193,147 @@ describe("ParameterCoordinator", () => {
       const accessor = getAccessor(semanticLayer);
       expect(accessor.setValue).toHaveBeenCalledWith(0, 0.5);
       expect(accessor.setValue).toHaveBeenCalledWith(1, 10);
+    });
+  });
+
+  describe("engine parameter lifecycle", () => {
+    /**
+     * Stateful mock: values are really stored, and each frame reproduces the
+     * engine's parameter lifecycle
+     * (Cubism4InternalModel.update: updateMotions → saveParameters → ... → loadParameters).
+     */
+    function createEngineRig(
+      options: { absorb?: boolean; engineWrite?: Record<string, number> } = {},
+    ) {
+      const ids = ["PARAM_ANGLE_X", "PARAM_BREATH"];
+      const values = new Float32Array(ids.length);
+      const saved = new Float32Array(ids.length);
+      const minimums = new Float32Array([-30, 0]);
+      const maximums = new Float32Array([30, 1]);
+      const defaults = new Float32Array([0, 0]);
+
+      const layer = new SemanticParameterLayer();
+      (layer as unknown as Record<string, unknown>).resolved = new Map([
+        ["angleX", { id: ids[0], index: 0 }],
+        ["breath", { id: ids[1], index: 1 }],
+      ]);
+      const setValueCalls: Array<[number, number]> = [];
+      (layer as unknown as Record<string, unknown>).accessor = {
+        getValue: (index: number) => values[index],
+        setValue: (index: number, value: number) => {
+          setValueCalls.push([index, value]);
+          // Same as setParameterValueByIndex(index, value) with weight 1.
+          values[index] = value;
+        },
+        getMin: (index: number) => minimums[index],
+        getMax: (index: number) => maximums[index],
+      };
+
+      const coordinator = new ParameterCoordinator(layer);
+      layer.setCoordinator(coordinator);
+
+      /** One engine frame: its own writes → saveParameters → ... → loadParameters. */
+      const engineFrame = () => {
+        for (const [id, value] of Object.entries(options.engineWrite ?? {})) {
+          values[ids.indexOf(id)] = value;
+        }
+        if (options.absorb === false) {
+          // An engine that rebuilds its parameters from its own state every frame.
+          values.set(defaults);
+          return;
+        }
+        saved.set(values);
+        values.set(saved);
+      };
+
+      /** One plugin frame: apply the previous queue, then queue the next write. */
+      const frame = (addValue: number | null) => {
+        engineFrame();
+        coordinator.flush();
+        if (addValue !== null) {
+          coordinator.queueWrite(
+            "angleX",
+            addValue,
+            "add",
+            "procedural",
+            SystemPriority.PROCEDURAL,
+          );
+        }
+      };
+
+      return { coordinator, frame, engineFrame, angleX: () => values[0], setValueCalls };
+    }
+
+    it("does not accumulate add writes across frames", () => {
+      const rig = createEngineRig();
+      for (let i = 0; i < 20; i++) rig.frame(15);
+
+      // 15 per frame relative to the engine baseline, not 15 * 20 clamped to 30.
+      expect(rig.angleX()).toBe(15);
+    });
+
+    it("stays correct when the engine resets parameters every frame", () => {
+      const rig = createEngineRig({ absorb: false });
+      for (let i = 0; i < 20; i++) rig.frame(15);
+
+      expect(rig.angleX()).toBe(15);
+    });
+
+    it("adds on top of a parameter the engine writes itself", () => {
+      const rig = createEngineRig({ engineWrite: { PARAM_ANGLE_X: 5 } });
+      for (let i = 0; i < 20; i++) rig.frame(15);
+
+      // engine 5 + our 15, stable instead of drifting upwards.
+      expect(rig.angleX()).toBe(20);
+    });
+
+    it("releases the contribution once the writer stops", () => {
+      const rig = createEngineRig();
+      for (let i = 0; i < 10; i++) rig.frame(15);
+      expect(rig.angleX()).toBe(15);
+
+      rig.frame(null);
+      // The add queued by the previous frame is applied once more...
+      expect(rig.angleX()).toBe(15);
+      // ...and released on the frame after, since nothing writes it anymore.
+      rig.frame(null);
+      expect(rig.angleX()).toBe(0);
+    });
+
+    it("keeps float32 values stable instead of drifting", () => {
+      const rig = createEngineRig();
+      for (let i = 0; i < 30; i++) rig.frame(0.1);
+
+      expect(rig.angleX()).toBeCloseTo(0.1, 6);
+    });
+
+    it("lets an override take the parameter over without leaving add residue", () => {
+      const rig = createEngineRig();
+      for (let i = 0; i < 5; i++) rig.frame(15);
+      rig.frame(null); // apply the add queued by the previous frame
+      expect(rig.angleX()).toBe(15);
+
+      rig.engineFrame();
+      rig.coordinator.queueWrite("angleX", 5, "override", "emotion", SystemPriority.EMOTION);
+      rig.coordinator.flush();
+      expect(rig.angleX()).toBe(5);
+
+      rig.engineFrame();
+      rig.coordinator.flush();
+      expect(rig.angleX()).toBe(5);
+    });
+
+    it("reset() drops pending writes and tracked contributions", () => {
+      const rig = createEngineRig();
+      for (let i = 0; i < 5; i++) rig.frame(15);
+      rig.coordinator.queueWrite("angleX", 25, "add", "procedural", SystemPriority.PROCEDURAL);
+
+      rig.coordinator.reset();
+      const callsBefore = rig.setValueCalls.length;
+      rig.engineFrame();
+      rig.coordinator.flush();
+
+      expect(rig.setValueCalls.length).toBe(callsBefore);
     });
   });
 });
