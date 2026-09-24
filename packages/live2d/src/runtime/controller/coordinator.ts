@@ -11,33 +11,26 @@ interface QueuedWrite {
 }
 
 /**
- * Bookkeeping for `add` writes, which are relative to the engine baseline.
+ * Applies the queued parameter writes from inside the engine's own update.
  *
- * The engine saves the current parameter values as its baseline every frame
- * (`CubismModel.saveParameters` / `saveParam`) and restores them at the end of
- * the same frame, so anything written after the engine update is baked into the
- * next frame's baseline. Without tracking our own contribution, every frame
- * would add on top of the previous frame's result and the parameter would drift
- * to its limit within a few frames.
+ * The engine saves the current parameter values as a baseline every frame
+ * (`CubismModel.saveParameters` / `saveParam`) and restores that baseline at the
+ * end of the same frame (`loadParameters` / `loadParam`). A write made after the
+ * restore therefore becomes part of the next frame's baseline, which made an
+ * `add` write - relative to the current value - stack on top of its own previous
+ * result until the parameter reached its limit.
  *
- * Note: while a motion is fading in the engine blends on top of our leftover
- * (`values = values * (1 - weight) + motion * weight`), so the recovered baseline
- * is only approximate for the duration of that fade. Once the fade completes
- * (weight 1) the motion overwrites the parameter and we take the engine value.
+ * Writing from the engine's `beforeModelUpdate` event instead - after the
+ * baseline was saved and before the model is rendered with the parameters -
+ * keeps a write visible for that frame only: an `add` is applied on top of the
+ * engine's current value and is dropped when the engine restores its baseline,
+ * so no bookkeeping of previous contributions is needed.
  */
-interface AppliedAdd {
-  /** Contribution applied last frame, relative to the engine baseline. */
-  contribution: number;
-  /** Absolute value actually written, read back after writing. */
-  written: number;
-}
-
 export class ParameterCoordinator {
   private queue = new Map<string, QueuedWrite[]>();
   private conflictLog: ConflictEntry[] = [];
   private semanticLayer: SemanticParameterLayer;
   private maxLogSize: number;
-  private appliedAdds = new Map<string, AppliedAdd>();
 
   constructor(
     semanticLayer: SemanticParameterLayer,
@@ -48,14 +41,13 @@ export class ParameterCoordinator {
   }
 
   /**
-   * Drop pending writes and add bookkeeping.
+   * Drop pending writes.
    *
    * Must be called when the model changes: pending writes were queued against
-   * the previous model, and the tracked contributions describe its parameters.
+   * the previous model's parameters.
    */
   reset(): void {
     this.queue.clear();
-    this.appliedAdds.clear();
   }
 
   /**
@@ -74,38 +66,15 @@ export class ParameterCoordinator {
   }
 
   /**
-   * Resolve all queued writes, detect conflicts, and apply to semantic layer.
-   * Should be called once per frame after all subsystems have queued writes.
+   * Resolve all queued writes, detect conflicts, and apply to the semantic
+   * layer. Driven by the engine's `beforeModelUpdate` event, so the values are
+   * part of that frame's render and are dropped by the engine afterwards.
    */
   flush(): void {
-    this.releaseStaleContributions();
-
     for (const [parameter, writes] of this.queue) {
       this.resolveParameter(parameter, writes);
     }
     this.queue.clear();
-  }
-
-  /**
-   * Release `add` contributions of parameters that were not written this frame.
-   *
-   * Because the engine absorbs our writes into its baseline (see
-   * {@link AppliedAdd}), a contribution does not disappear when its writer stops:
-   * it has to be subtracted explicitly. Parameters the engine rewrote this frame
-   * are left alone, since the engine already took them over.
-   */
-  private releaseStaleContributions(): void {
-    for (const [parameter, record] of this.appliedAdds) {
-      if (this.queue.has(parameter)) continue;
-
-      this.appliedAdds.delete(parameter);
-      if (record.contribution === 0) continue;
-
-      const current = this.semanticLayer.getSemantic(parameter);
-      if (current === undefined || record.written !== current) continue;
-
-      this.applyAbsolute(parameter, current - record.contribution);
-    }
   }
 
   /**
@@ -144,8 +113,7 @@ export class ParameterCoordinator {
 
     for (const write of writes) {
       if (write.blendMode === "override") {
-        // Lower priority number wins; on a tie keep the first one queued
-        // (same as the original `reduce((a, b) => (a.priority <= b.priority ? a : b))`).
+        // Lower priority number wins; on a tie keep the first one queued.
         if (winner === null || write.priority < winner.priority) {
           winner = write;
         }
@@ -155,67 +123,24 @@ export class ParameterCoordinator {
       }
     }
 
+    if (winner === null) {
+      // Only relative writes: stack them on the engine's current value. The
+      // engine drops them when it restores its baseline, so they never
+      // accumulate across frames.
+      const current = this.semanticLayer.getSemantic(parameter) ?? 0;
+      this.applyAbsolute(parameter, current + addSum);
+      return;
+    }
+
     // Resolve override conflicts: lowest priority number wins (MANUAL=1 is highest)
-    let finalValue = 0;
-    let hasOverride = false;
-
-    if (winner !== null) {
-      hasOverride = true;
-      finalValue = winner.value;
-
-      // Log conflicts from other override sources
-      for (const write of writes) {
-        if (write !== winner && write.blendMode === "override") {
-          this.logConflict(parameter, winner, write);
-        }
+    for (const write of writes) {
+      if (write !== winner && write.blendMode === "override") {
+        this.logConflict(parameter, winner, write);
       }
     }
 
-    // Sum all add outputs (adds don't conflict, they accumulate)
-    if (hasAdd) {
-      finalValue = hasOverride ? finalValue + addSum : addSum;
-    }
-
-    // The engine absorbs our writes into its baseline, so an `add` cannot be
-    // applied on top of the current value: subtract our own previous
-    // contribution first to recover the engine baseline.
-    const current = this.semanticLayer.getSemantic(parameter) ?? 0;
-    let engineBaseline = current;
-
-    if (hasOverride) {
-      // `override` is absolute, it takes the parameter over; stop tracking adds.
-      this.appliedAdds.delete(parameter);
-    } else {
-      const previous = this.appliedAdds.get(parameter);
-      // `written === current` means the engine did not touch this parameter
-      // this frame, so our previous write is still in place.
-      if (previous && previous.written === current) {
-        engineBaseline = current - previous.contribution;
-      }
-    }
-
-    this.applyAbsolute(
-      parameter,
-      hasOverride ? finalValue : engineBaseline + finalValue,
-    );
-
-    if (!hasOverride) {
-      // Read the value back: `setSemantic` clamps it and Float32Array storage
-      // rounds it, so only the stored value can be compared exactly next frame.
-      const written = this.semanticLayer.getSemantic(parameter);
-      if (written !== undefined) {
-        const record = this.appliedAdds.get(parameter);
-        if (record) {
-          record.contribution = written - engineBaseline;
-          record.written = written;
-        } else {
-          this.appliedAdds.set(parameter, {
-            contribution: written - engineBaseline,
-            written,
-          });
-        }
-      }
-    }
+    // Adds don't conflict, they accumulate on top of the winning override.
+    this.applyAbsolute(parameter, hasAdd ? winner.value + addSum : winner.value);
   }
 
   private logConflict(
