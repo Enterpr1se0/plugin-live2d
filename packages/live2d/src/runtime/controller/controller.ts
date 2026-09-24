@@ -16,6 +16,18 @@ import type {
 } from "./types";
 import { ParameterCoordinator } from "./coordinator";
 
+/**
+ * The part of the engine's `InternalModel` the runtime relies on.
+ *
+ * `InternalModel` is an `EventEmitter` that emits `beforeModelUpdate` right
+ * before the model is updated with its parameters applied, which is where the
+ * runtime flushes its parameter writes.
+ */
+interface EngineInternalModel {
+  on(event: "beforeModelUpdate", handler: () => void): unknown;
+  off(event: "beforeModelUpdate", handler: () => void): unknown;
+}
+
 export class Live2dRuntimeController {
   private semanticLayer: SemanticParameterLayer;
   private filterPipeline: FilterPipeline;
@@ -137,18 +149,22 @@ export class Live2dRuntimeController {
       this._tickerCallbacks.push(() => ticker.remove(emotionTicker));
     }
 
-    // 7. Hook engine's internalModel.update so our parameter flush runs AFTER
-    // engine auto-updates (physics, blink, expression, idle motion).
-    // This ensures manual effects override engine values instead of being overwritten.
+    // 7. Apply parameter writes from the engine's `beforeModelUpdate` event.
+    //
+    // The engine saves its parameter baseline after applying motions and restores
+    // it at the end of the same update (`saveParameters`/`loadParameters`, and
+    // `saveParam`/`loadParam` for Cubism 2). `beforeModelUpdate` fires after the
+    // engine's own updates (blink, focus, breathing, physics, pose) and right
+    // before the model is updated, so a write made there is rendered in the
+    // current frame and dropped with the restore: the baseline never absorbs our
+    // writes and `add` needs no bookkeeping. This also keeps manual effects
+    // overriding engine values instead of being overwritten by them.
     const internalModel = this.extractInternalModel(model);
     if (internalModel) {
-      const originalUpdate = internalModel.update.bind(internalModel);
-      internalModel.update = (dt: number, now?: number) => {
-        originalUpdate(dt, now);
-        this.coordinator.flush();
-      };
+      const onBeforeModelUpdate = () => this.coordinator.flush();
+      internalModel.on("beforeModelUpdate", onBeforeModelUpdate);
       this._tickerCallbacks.push(() => {
-        internalModel.update = originalUpdate;
+        internalModel.off("beforeModelUpdate", onBeforeModelUpdate);
       });
     }
 
@@ -281,12 +297,9 @@ export class Live2dRuntimeController {
 
   private extractInternalModel(
     model: Live2DModel,
-  ): { update(dt: number, now?: number): void } | undefined {
+  ): EngineInternalModel | undefined {
     const record = model as unknown as Record<string, unknown>;
-    const internalModel = record.internalModel as
-      | { update(dt: number, now?: number): void }
-      | undefined;
-    return internalModel;
+    return record.internalModel as EngineInternalModel | undefined;
   }
 
   private getTransitionProgress(): number {

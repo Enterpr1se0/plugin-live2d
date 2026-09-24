@@ -173,16 +173,37 @@ describe("ParameterCoordinator", () => {
   });
 
   describe("per-frame isolation", () => {
-    it("clears queue after flush", () => {
+    it("clears the queue after flush and keeps held overrides in effect", () => {
       coordinator.queueWrite("mouthOpen", 0.5, "override", "fsm", SystemPriority.FSM);
       coordinator.flush();
 
       const accessor = getAccessor(semanticLayer);
-      const callCount = accessor.setValue.mock.calls.length;
+      expect(accessor.setValue).toHaveBeenCalledTimes(1);
 
-      // Second flush should not apply anything new
+      // The queue is empty, so nothing new is applied — but the override is
+      // re-applied, because the engine drops it with its baseline every frame.
+      accessor.setValue.mockClear();
       coordinator.flush();
-      expect(accessor.setValue).toHaveBeenCalledTimes(callCount);
+      expect(accessor.setValue).toHaveBeenCalledTimes(1);
+      expect(accessor.setValue).toHaveBeenCalledWith(0, 0.5);
+
+      // An `add` is a single-frame contribution, so the next flush falls back to
+      // the held override instead of keeping the sum.
+      accessor.setValue.mockClear();
+      coordinator.queueWrite(
+        "mouthOpen",
+        0.2,
+        "add",
+        "procedural",
+        SystemPriority.PROCEDURAL,
+      );
+      coordinator.flush();
+      expect(accessor.setValue).toHaveBeenCalledWith(0, 0.7);
+
+      accessor.setValue.mockClear();
+      coordinator.flush();
+      expect(accessor.setValue).toHaveBeenCalledTimes(1);
+      expect(accessor.setValue).toHaveBeenCalledWith(0, 0.5);
     });
 
     it("handles multiple parameters independently", () => {
@@ -200,17 +221,21 @@ describe("ParameterCoordinator", () => {
     /**
      * Stateful mock: values are really stored, and each frame reproduces the
      * engine's parameter lifecycle
-     * (Cubism4InternalModel.update: updateMotions → saveParameters → ... → loadParameters).
+     * (Cubism4InternalModel.update: updateMotions → saveParameters → blink/focus/
+     * breathing/physics/pose → emit("beforeModelUpdate") → model.update() →
+     * loadParameters). The runtime flushes from `beforeModelUpdate`, so what it
+     * writes is what the model is updated with, and the engine drops those values
+     * again when it restores its baseline.
      */
     function createEngineRig(
-      options: { absorb?: boolean; engineWrite?: Record<string, number> } = {},
+      options: { engineWrite?: Record<string, number> } = {},
     ) {
       const ids = ["PARAM_ANGLE_X", "PARAM_BREATH"];
       const values = new Float32Array(ids.length);
       const saved = new Float32Array(ids.length);
       const minimums = new Float32Array([-30, 0]);
       const maximums = new Float32Array([30, 1]);
-      const defaults = new Float32Array([0, 0]);
+      let rendered = 0;
 
       const layer = new SemanticParameterLayer();
       (layer as unknown as Record<string, unknown>).resolved = new Map([
@@ -232,36 +257,55 @@ describe("ParameterCoordinator", () => {
       const coordinator = new ParameterCoordinator(layer);
       layer.setCoordinator(coordinator);
 
-      /** One engine frame: its own writes → saveParameters → ... → loadParameters. */
+      /**
+       * One engine frame: its own writes → saveParameters → the `beforeModelUpdate`
+       * event → model.update() → loadParameters.
+       */
       const engineFrame = () => {
         for (const [id, value] of Object.entries(options.engineWrite ?? {})) {
           values[ids.indexOf(id)] = value;
         }
-        if (options.absorb === false) {
-          // An engine that rebuilds its parameters from its own state every frame.
-          values.set(defaults);
-          return;
-        }
-        saved.set(values);
-        values.set(saved);
+        saved.set(values); // saveParameters / saveParam
+        coordinator.flush(); // emit("beforeModelUpdate")
+        rendered = values[0]; // what model.update() draws this frame
+        values.set(saved); // loadParameters / loadParam
       };
 
       /** One plugin frame: apply the previous queue, then queue the next write. */
       const frame = (addValue: number | null) => {
         engineFrame();
-        coordinator.flush();
         if (addValue !== null) {
-          coordinator.queueWrite(
-            "angleX",
-            addValue,
-            "add",
-            "procedural",
-            SystemPriority.PROCEDURAL,
-          );
+          queueAdd(addValue);
         }
       };
 
-      return { coordinator, frame, engineFrame, angleX: () => values[0], setValueCalls };
+      const queueAdd = (value: number) =>
+        coordinator.queueWrite(
+          "angleX",
+          value,
+          "add",
+          "procedural",
+          SystemPriority.PROCEDURAL,
+        );
+
+      const queueOverride = (
+        value: number,
+        source = "emotion",
+        priority: SystemPriority = SystemPriority.EMOTION,
+      ) => coordinator.queueWrite("angleX", value, "override", source, priority);
+
+      return {
+        coordinator,
+        frame,
+        engineFrame,
+        queueAdd,
+        queueOverride,
+        /** Value the model was updated with in the last frame. */
+        angleX: () => rendered,
+        /** Value the engine holds once it restored its baseline. */
+        engineValue: () => values[0],
+        setValueCalls,
+      };
     }
 
     it("does not accumulate add writes across frames", () => {
@@ -269,13 +313,6 @@ describe("ParameterCoordinator", () => {
       for (let i = 0; i < 20; i++) rig.frame(15);
 
       // 15 per frame relative to the engine baseline, not 15 * 20 clamped to 30.
-      expect(rig.angleX()).toBe(15);
-    });
-
-    it("stays correct when the engine resets parameters every frame", () => {
-      const rig = createEngineRig({ absorb: false });
-      for (let i = 0; i < 20; i++) rig.frame(15);
-
       expect(rig.angleX()).toBe(15);
     });
 
@@ -292,10 +329,10 @@ describe("ParameterCoordinator", () => {
       for (let i = 0; i < 10; i++) rig.frame(15);
       expect(rig.angleX()).toBe(15);
 
+      // The add queued by the last frame is applied once more, then released:
+      // an `add` is a contribution for a single frame only.
       rig.frame(null);
-      // The add queued by the previous frame is applied once more...
       expect(rig.angleX()).toBe(15);
-      // ...and released on the frame after, since nothing writes it anymore.
       rig.frame(null);
       expect(rig.angleX()).toBe(0);
     });
@@ -307,33 +344,53 @@ describe("ParameterCoordinator", () => {
       expect(rig.angleX()).toBeCloseTo(0.1, 6);
     });
 
-    it("lets an override take the parameter over without leaving add residue", () => {
+    it("lets an override take the parameter over", () => {
       const rig = createEngineRig();
-      for (let i = 0; i < 5; i++) rig.frame(15);
-      rig.frame(null); // apply the add queued by the previous frame
-      expect(rig.angleX()).toBe(15);
-
+      rig.queueOverride(5);
       rig.engineFrame();
-      rig.coordinator.queueWrite("angleX", 5, "override", "emotion", SystemPriority.EMOTION);
-      rig.coordinator.flush();
       expect(rig.angleX()).toBe(5);
 
+      // Held across frames where its writer is silent, while the engine itself
+      // keeps its own value (it dropped ours with the baseline restore).
       rig.engineFrame();
-      rig.coordinator.flush();
       expect(rig.angleX()).toBe(5);
+      expect(rig.engineValue()).toBe(0);
     });
 
-    it("reset() drops pending writes and tracked contributions", () => {
+    it("holds an override until another writer takes the parameter over", () => {
       const rig = createEngineRig();
-      for (let i = 0; i < 5; i++) rig.frame(15);
-      rig.coordinator.queueWrite("angleX", 25, "add", "procedural", SystemPriority.PROCEDURAL);
+      rig.queueOverride(10, "manual", SystemPriority.MANUAL);
+      rig.engineFrame();
+      expect(rig.angleX()).toBe(10);
 
+      // An add is applied on top of the held override and released when it stops.
+      rig.queueAdd(5);
+      rig.engineFrame();
+      expect(rig.angleX()).toBe(15);
+      rig.engineFrame();
+      expect(rig.angleX()).toBe(10);
+
+      // A later override replaces the held value.
+      rig.queueOverride(3);
+      rig.engineFrame();
+      expect(rig.angleX()).toBe(3);
+    });
+
+    it("reset() drops pending writes and held overrides", () => {
+      const rig = createEngineRig();
+      rig.queueOverride(10);
+      rig.engineFrame();
+      expect(rig.angleX()).toBe(10);
+
+      rig.queueAdd(5);
       rig.coordinator.reset();
+
       const callsBefore = rig.setValueCalls.length;
       rig.engineFrame();
-      rig.coordinator.flush();
 
+      // Nothing pending and no override left, so the engine keeps its own value.
       expect(rig.setValueCalls.length).toBe(callsBefore);
+      expect(rig.angleX()).toBe(0);
     });
   });
 });
